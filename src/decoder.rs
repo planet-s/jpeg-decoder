@@ -10,8 +10,7 @@ use std::io::Read;
 use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
-use worker_thread::{RowData, spawn_worker_thread, WorkerMsg};
+use worker::{RowData, Worker};
 
 pub const MAX_COMPONENTS: usize = 4;
 
@@ -131,7 +130,7 @@ impl<R: Read> Decoder<R> {
 
         let mut previous_marker = Marker::SOI;
         let mut pending_marker = None;
-        let mut worker_chan = None;
+        let mut worker = None;
         let mut scans_processed = 0;
         let mut planes = vec![Vec::new(); self.frame.as_ref().map_or(0, |frame| frame.components.len())];
 
@@ -191,8 +190,8 @@ impl<R: Read> Decoder<R> {
                     if self.frame.is_none() {
                         return Err(Error::Format("scan encountered before frame".to_owned()));
                     }
-                    if worker_chan.is_none() {
-                        worker_chan = Some(try!(spawn_worker_thread()));
+                    if worker.is_none() {
+                        worker = Some(Worker::new());
                     }
 
                     let frame = self.frame.clone().unwrap();
@@ -214,7 +213,7 @@ impl<R: Read> Decoder<R> {
                     }
 
                     let is_final_scan = scan.component_indices.iter().all(|&i| self.coefficients_finished[i] == !0);
-                    let (marker, data) = try!(self.decode_scan(&frame, &scan, worker_chan.as_ref().unwrap(), is_final_scan));
+                    let (marker, data) = try!(self.decode_scan(&frame, &scan, worker.as_mut().unwrap(), is_final_scan));
 
                     if let Some(data) = data {
                         for (i, plane) in data.into_iter().enumerate().filter(|&(_, ref plane)| !plane.is_empty()) {
@@ -354,7 +353,7 @@ impl<R: Read> Decoder<R> {
     fn decode_scan(&mut self,
                    frame: &FrameInfo,
                    scan: &ScanInfo,
-                   worker_chan: &Sender<WorkerMsg>,
+                   worker: &mut Worker,
                    produce_data: bool)
                    -> Result<(Option<Marker>, Option<Vec<Vec<u8>>>)> {
         assert!(scan.component_indices.len() <= MAX_COMPONENTS);
@@ -387,7 +386,7 @@ impl<R: Read> Decoder<R> {
                     quantization_table: self.quantization_tables[component.quantization_table_index].clone().unwrap(),
                 };
 
-                try!(worker_chan.send(WorkerMsg::Start(row_data)));
+                worker.start(row_data);
             }
         }
 
@@ -509,7 +508,7 @@ impl<R: Read> Decoder<R> {
                         mem::replace(&mut mcu_row_coefficients[i], vec![0i16; coefficients_per_mcu_row])
                     };
 
-                    try!(worker_chan.send(WorkerMsg::AppendRow((i, row_coefficients))));
+                    worker.append_row(i, row_coefficients);
                 }
             }
         }
@@ -521,10 +520,7 @@ impl<R: Read> Decoder<R> {
             let mut data = vec![Vec::new(); frame.components.len()];
 
             for (i, &component_index) in scan.component_indices.iter().enumerate() {
-                let (tx, rx) = mpsc::channel();
-                try!(worker_chan.send(WorkerMsg::GetResult((i, tx))));
-
-                data[component_index] = try!(rx.recv());
+                data[component_index] = worker.get_result(i);
             }
 
             Ok((marker, Some(data)))
